@@ -1,0 +1,235 @@
+// A client of Redis for Cromo: a 'Client' is a connection to a server, with the
+// commands used most as methods, and 'command' for all the others. The package is
+// written in Cromo, on std.net, and needs nothing else.
+//
+// '''
+// import redis
+//
+// redis.Client store = redis.connect("localhost", 6379)
+// store.set("greeting", "hello")
+// string found
+// if (store.get("greeting", ref found)) {
+//     println("{}", found)   // hello
+// }
+// println("{}", store.incr("visits"))
+// '''
+//
+// An answer of the server that is an error, as for a command that it does not know,
+// throws an 'Error' with its text. A client is for one thread at a time: each thread
+// that talks to the server has its own.
+import std.net
+
+// What an answer of the server is.
+public enum Kind {
+    Nil      // nothing: a key that is not there
+    Text     // a text, or bytes read as a text
+    Integer  // a number
+    Array    // more answers, in 'items'
+}
+
+// An answer of the server, for 'Client.command'.
+public struct Reply {
+    public Kind kind
+    public string text        // of a text
+    public i64 number         // of an integer
+    public list<Reply> items  // of an array
+}
+
+// A connection to a server of Redis. It is not copied, only moved, and is closed
+// when it ends.
+public struct Client {
+    net.Connection connection
+    list<u8> pending  // what the server sent and is not read yet
+    i64 at            // how much of it is read
+
+    // Sends a command, its name and its arguments, and gives the answer of the server:
+    // `command(["LPUSH", "queue", "job"])`. Throws an 'Error' with what the server says
+    // when it refuses, and when the connection ends.
+    public Reply command(list<string> words) {
+        if (words.len() == 0) {
+            panic("a command of Redis has at least its name")
+        }
+        string request = format("*{}\r\n", words.len())
+        for (string word in words) {
+            request += format("${}\r\n", word.len())
+            request += word
+            request += "\r\n"
+        }
+        connection.writeText(request)
+        ret answer()
+    }
+
+    // The value of a key, in `value`; false when the key is not there.
+    public bool get(string key, ref string value) {
+        Reply r = command(["GET", key])
+        if (r.kind == Kind.Nil) {
+            ret false
+        }
+        value = r.text
+        ret true
+    }
+
+    // Gives a key a value, in place of the one it had.
+    public void set(string key, string value) {
+        command(["SET", key, value])
+    }
+
+    // Gives a key a value that the server forgets after some seconds.
+    public void setFor(string key, string value, i64 seconds) {
+        command(["SET", key, value, "EX", format("{}", seconds)])
+    }
+
+    // Removes a key; false when it was not there.
+    public bool remove(string key) {
+        ret command(["DEL", key]).number > 0
+    }
+
+    // Whether a key is there.
+    public bool exists(string key) {
+        ret command(["EXISTS", key]).number > 0
+    }
+
+    // Adds 1 to the number of a key, which starts from 0, and gives the new one.
+    public i64 incr(string key) {
+        ret command(["INCR", key]).number
+    }
+
+    // Adds a number to the number of a key, and gives the new one.
+    public i64 incrBy(string key, i64 amount) {
+        ret command(["INCRBY", key, format("{}", amount)]).number
+    }
+
+    // Makes the server forget a key after some seconds; false when it is not there.
+    public bool expire(string key, i64 seconds) {
+        ret command(["EXPIRE", key, format("{}", seconds)]).number > 0
+    }
+
+    // The keys that match a pattern, as "user:*": for a small database, since the
+    // server looks at all its keys.
+    public list<string> keys(string pattern) {
+        list<string> found
+        for (Reply item in command(["KEYS", pattern]).items) {
+            found.add(item.text)
+        }
+        ret found
+    }
+
+    // Gives the password to a server that asks for one.
+    public void auth(string password) {
+        command(["AUTH", password])
+    }
+
+    // Chooses a database of the server by its number: 0 at the start.
+    public void select(i64 database) {
+        command(["SELECT", format("{}", database)])
+    }
+
+    // Whether the server answers.
+    public bool ping() {
+        ret command(["PING"]).text == "PONG"
+    }
+
+    // ---- The answers, in the protocol of Redis (RESP) ----
+
+    // More bytes from the server.
+    void fill() {
+        list<u8> more = connection.read(65536)
+        if (more.len() == 0) {
+            throw Error("the server of Redis closed the connection")
+        }
+        if (at > 0) {  // what is read already is left behind
+            list<u8> rest
+            for (i64 i = at; i < pending.len(); i++) {
+                rest.add(pending[i])
+            }
+            pending = rest
+            at = 0
+        }
+        for (u8 b in more) {
+            pending.add(b)
+        }
+    }
+
+    // A line of an answer, without its end.
+    string line() {
+        for (true) {
+            for (i64 i = at; i + 1 < pending.len(); i++) {
+                if (pending[i] == '\r' && pending[i + 1] == '\n') {
+                    list<u8> bytes
+                    for (i64 k = at; k < i; k++) {
+                        bytes.add(pending[k])
+                    }
+                    at = i + 2
+                    ret string(bytes)
+                }
+            }
+            fill()
+        }
+        ret ""
+    }
+
+    // `count` bytes of an answer, and the end of line after them.
+    string bytes(i64 count) {
+        for (pending.len() - at < count + 2) {
+            fill()
+        }
+        list<u8> taken
+        taken.reserve(count)
+        for (i64 i = 0; i < count; i++) {
+            taken.add(pending[at + i])
+        }
+        at += count + 2
+        ret string(taken)
+    }
+
+    Reply answer() {
+        string head = line()
+        if (head.len() == 0) {
+            throw Error("the server of Redis sent an answer that is not of its protocol")
+        }
+        u8 sort = head[0]
+        string rest = head.slice(1, head.len())
+        Reply r
+        if (sort == '+') {
+            r.kind = Kind.Text
+            r.text = rest
+        } else if (sort == '-') {
+            throw Error(format("Redis: {}", rest))
+        } else if (sort == ':') {
+            r.kind = Kind.Integer
+            r.number = i64(rest)
+        } else if (sort == '$') {
+            i64 size = i64(rest)
+            if (size >= 0) {
+                r.kind = Kind.Text
+                r.text = bytes(size)
+            }
+        } else if (sort == '*') {
+            i64 count = i64(rest)
+            if (count >= 0) {
+                r.kind = Kind.Array
+                for (i64 i = 0; i < count; i++) {
+                    r.items.add(answer())
+                }
+            }
+        } else {
+            throw Error("the server of Redis sent an answer that is not of its protocol")
+        }
+        ret r
+    }
+}
+
+// Connects to a server of Redis: 6379 is its usual port. Throws an 'Error' when the
+// server cannot be reached.
+public Client connect(string host, i32 port) {
+    Client made
+    made.connection = net.connect(host, port)
+    ret made
+}
+
+// Connects to a server of Redis over TLS, as those of the services in the cloud.
+public Client connectTls(string host, i32 port) {
+    Client made
+    made.connection = net.connectTls(host, port)
+    ret made
+}

@@ -1,0 +1,204 @@
+// The tests of the package: cromo test redis.cro, in this folder. The server is a
+// small one in this file, which speaks the protocol of Redis for a few commands, so
+// that the tests need no server installed: what is tested is what the client sends
+// and how it reads the answers.
+import std.net
+import std.thread
+
+// One command read from a connection: its words; none when the connection ends.
+list<string> request(ref net.Connection c, ref list<u8> pending) {
+    list<string> words
+    for (true) {
+        // *count, then for each word $length and its bytes, each ended by \r\n.
+        string text = string(pending)
+        i64 at = 0
+        bool whole = false
+        if (text.startsWith("*")) {
+            i64 end = text.find("\r\n")
+            if (end > 0) {
+                i64 count = i64(text.slice(1, end))
+                at = end + 2
+                whole = true
+                words.clear()
+                for (i64 i = 0; i < count && whole; i++) {
+                    i64 stop = text.findFrom("\r\n", at)
+                    if (stop < 0) {
+                        whole = false
+                        break
+                    }
+                    i64 size = i64(text.slice(at + 1, stop))
+                    if (stop + 2 + size + 2 > text.len()) {
+                        whole = false
+                        break
+                    }
+                    words.add(text.slice(stop + 2, stop + 2 + size))
+                    at = stop + 2 + size + 2
+                }
+            }
+        }
+        if (whole) {
+            list<u8> rest
+            for (i64 i = at; i < pending.len(); i++) {
+                rest.add(pending[i])
+            }
+            pending = rest
+            ret words
+        }
+        list<u8> more = c.read(4096)
+        if (more.len() == 0) {
+            words.clear()
+            ret words
+        }
+        for (u8 b in more) {
+            pending.add(b)
+        }
+    }
+    ret words
+}
+
+void serve(net.Listener listener) {
+    net.Connection c = listener.accept()
+    map<string, string> data
+    list<string> names  // its keys
+    list<u8> pending
+    for (true) {
+        list<string> words = request(ref c, ref pending)
+        if (words.len() == 0) {
+            ret
+        }
+        string name = words[0]
+        if (name == "PING") {
+            c.writeText("+PONG\r\n")
+        } else if (name == "SET") {
+            if (!data.contains(words[1])) {
+                names.add(words[1])
+            }
+            data[words[1]] = words[2]
+            c.writeText("+OK\r\n")
+        } else if (name == "GET") {
+            if (data.contains(words[1])) {
+                string value = data[words[1]]
+                c.writeText(format("${}\r\n", value.len()) + value + "\r\n")
+            } else {
+                c.writeText("$-1\r\n")
+            }
+        } else if (name == "DEL" || name == "EXISTS") {
+            bool had = data.contains(words[1])
+            if (had && name == "DEL") {
+                data.remove(words[1])
+            }
+            c.writeText(had ? ":1\r\n" : ":0\r\n")
+        } else if (name == "INCR" || name == "INCRBY") {
+            i64 now = data.contains(words[1]) ? i64(data[words[1]]) : 0
+            now += name == "INCR" ? 1 : i64(words[2])
+            data[words[1]] = format("{}", now)
+            c.writeText(format(":{}\r\n", now))
+        } else if (name == "KEYS") {
+            list<string> found
+            for (string key in names) {
+                if (data.contains(key)) {
+                    found.add(key)
+                }
+            }
+            sort(ref found)
+            string reply = format("*{}\r\n", found.len())
+            for (string key in found) {
+                reply += format("${}\r\n", key.len()) + key + "\r\n"
+            }
+            c.writeText(reply)
+        } else if (name == "ECHO") {  // the words back, as an array in an array
+            string reply = "*2\r\n:7\r\n" + format("*{}\r\n", words.len() - 1)
+            for (i64 i = 1; i < words.len(); i++) {
+                reply += format("${}\r\n", words[i].len()) + words[i] + "\r\n"
+            }
+            c.writeText(reply)
+        } else {
+            c.writeText(format("-ERR unknown command '{}'\r\n", name))
+        }
+    }
+}
+
+[[test]]
+void theKeys() {
+    net.Listener listener = net.listen("127.0.0.1", 0)
+    i32 port = listener.port()
+    thread.Thread server = thread.Thread([listener]() { serve(listener) })
+    server.start()
+    Client c = connect("127.0.0.1", port)
+    assert(c.ping())
+    string value
+    assert(!c.get("greeting", ref value))
+    c.set("greeting", "hello")
+    assert(c.get("greeting", ref value) && value == "hello")
+    assert(c.exists("greeting"))
+    assert(c.remove("greeting"))
+    assert(!c.remove("greeting"))
+    assert(!c.exists("greeting"))
+}
+
+[[test]]
+void theNumbers() {
+    net.Listener listener = net.listen("127.0.0.1", 0)
+    i32 port = listener.port()
+    thread.Thread server = thread.Thread([listener]() { serve(listener) })
+    server.start()
+    Client c = connect("127.0.0.1", port)
+    assert(c.incr("visits") == 1)
+    assert(c.incr("visits") == 2)
+    assert(c.incrBy("visits", 40) == 42)
+    string value
+    assert(c.get("visits", ref value) && value == "42")
+}
+
+[[test]]
+void theBytesOfAText() {
+    net.Listener listener = net.listen("127.0.0.1", 0)
+    i32 port = listener.port()
+    thread.Thread server = thread.Thread([listener]() { serve(listener) })
+    server.start()
+    Client c = connect("127.0.0.1", port)
+    string odd = "two\r\nlines, è, 日本, and $5 *3 +OK"
+    c.set("odd", odd)
+    string value
+    assert(c.get("odd", ref value) && value == odd)
+    string large
+    for (i64 i = 0; i < 20000; i++) {
+        large += "0123456789"
+    }
+    c.set("large", large)
+    assert(c.get("large", ref value) && value.len() == 200000 && value == large)
+}
+
+[[test]]
+void theArrays() {
+    net.Listener listener = net.listen("127.0.0.1", 0)
+    i32 port = listener.port()
+    thread.Thread server = thread.Thread([listener]() { serve(listener) })
+    server.start()
+    Client c = connect("127.0.0.1", port)
+    c.set("b", "2")
+    c.set("a", "1")
+    list<string> keys = c.keys("*")
+    assert(keys.len() == 2 && keys[0] == "a" && keys[1] == "b")
+    Reply r = c.command(["ECHO", "x", "yy"])
+    assert(r.kind == Kind.Array && r.items.len() == 2)
+    assert(r.items[0].kind == Kind.Integer && r.items[0].number == 7)
+    assert(r.items[1].items.len() == 2 && r.items[1].items[1].text == "yy")
+}
+
+[[test]]
+void anError() {
+    net.Listener listener = net.listen("127.0.0.1", 0)
+    i32 port = listener.port()
+    thread.Thread server = thread.Thread([listener]() { serve(listener) })
+    server.start()
+    Client c = connect("127.0.0.1", port)
+    bool refused = false
+    try {
+        c.command(["FLY", "away"])
+    } catch (Error e) {
+        refused = e.message() == "Redis: ERR unknown command 'FLY'"
+    }
+    assert(refused)
+    assert(c.ping())  // the connection goes on
+}
